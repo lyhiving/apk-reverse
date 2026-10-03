@@ -1,0 +1,52 @@
+<!--
+ * (c) Meta Platforms, Inc. and affiliates. Confidential and proprietary.
+ -->
+<!DOCTYPE html>
+<html>
+
+<head>
+    <meta charset="UTF-8">
+    <!-- minimum-scale/maximum-scale must differ and user-scalable must stay on, or WebView
+         disables pinch-zoom no matter what setSupportZoom/builtInZoomControls say. -->
+    <meta name="viewport"
+        content="width=device-width, initial-scale=1.0, minimum-scale=0.25, maximum-scale=5.0, user-scalable=yes, viewport-fit=cover" />
+    <meta name="color-scheme" content="only light">
+    <meta http-equiv="Content-Security-Policy"
+        content="default-src 'self'; connect-src 'self'; img-src 'self' data: blob:; media-src 'self' data: blob:; font-src 'self' data:; style-src 'self' 'unsafe-inline'; script-src 'self'; object-src 'none'; base-uri 'none'; form-action 'none'">
+
+    <style>
+        body {
+            margin: 0;
+            padding: 0;
+            background: #FFFFFF;
+            color: #272727;
+        }
+
+        /* docx-preview emits a fixed-width page shaped like the authored paper size. Center it and
+           let it shrink to the viewport so a portrait phone shows the full column width. */
+        #document-container .docx-wrapper {
+            align-items: flex-start;
+            width: fit-content;
+            min-width: 100%;
+            box-sizing: border-box;
+            padding: 0;
+            background: #FFFFFF;
+        }
+
+        #document-container .docx-wrapper>section.docx {
+            margin-left: auto;
+            margin-right: auto;
+            box-shadow: none;
+        }
+    </style>
+
+    <script type="text/javascript" src="jszip.min.js"></script>
+    <script type="text/javascript" src="docx-preview.min.js"></script>
+    <script type="text/javascript" src="hatch_docx_viewer.js"></script>
+</head>
+
+<body>
+    <div id="document-container"></div>
+</body>
+
+</html>

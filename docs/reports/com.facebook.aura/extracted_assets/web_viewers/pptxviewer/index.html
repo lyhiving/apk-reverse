@@ -1,0 +1,41 @@
+<!--
+ * (c) Meta Platforms, Inc. and affiliates. Confidential and proprietary.
+ -->
+<!DOCTYPE html>
+<html>
+
+<head>
+    <meta charset="UTF-8">
+    <!-- minimum-scale/maximum-scale must differ and user-scalable must stay on, or WebView
+         disables pinch-zoom no matter what setSupportZoom/builtInZoomControls say. -->
+    <meta name="viewport"
+        content="width=device-width, initial-scale=1.0, minimum-scale=0.25, maximum-scale=5.0, user-scalable=yes, viewport-fit=cover" />
+    <meta name="color-scheme" content="only light">
+    <meta http-equiv="Content-Security-Policy"
+        content="default-src 'self'; connect-src 'self'; img-src 'self' data: blob:; media-src 'self' data: blob:; font-src 'self' data:; style-src 'self' 'unsafe-inline'; script-src 'self'; object-src 'none'; base-uri 'none'; form-action 'none'">
+
+    <link rel="stylesheet" href="pptxjs.min.css">
+    <link rel="stylesheet" href="nv.d3.min.css">
+
+    <style>
+        body {
+            margin: 0;
+            padding: 0;
+            background: #FFFFFF;
+            color: #272727;
+        }
+    </style>
+
+    <script type="text/javascript" src="jszip.min.js"></script>
+    <script type="text/javascript" src="filereader.min.js"></script>
+    <script type="text/javascript" src="d3.min.js"></script>
+    <script type="text/javascript" src="nv.d3.min.js"></script>
+    <script type="text/javascript" src="pptxjs.min.js"></script>
+    <script type="text/javascript" src="hatch_pptx_viewer.js"></script>
+</head>
+
+<body>
+    <div id="document-container"></div>
+</body>
+
+</html>

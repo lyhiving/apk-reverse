@@ -1,0 +1,72 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, minimum-scale=0.25, maximum-scale=5.0, user-scalable=yes, viewport-fit=cover" />
+  <meta name="color-scheme" content="only light">
+  <title>PDF Document Viewer & Print</title>
+  <style>
+    body {
+      margin: 0;
+      padding: 0;
+      background: #525659;
+      color: #272727;
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+    }
+    #document-container {
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      padding: 16px 8px;
+      box-sizing: border-box;
+      min-height: 100vh;
+    }
+    .pdf-page-canvas {
+      box-shadow: 0 4px 12px rgba(0, 0, 0, 0.3);
+      margin-bottom: 16px;
+      background: #FFFFFF;
+      max-width: 98%;
+      height: auto;
+    }
+    .pdf-toolbar {
+      position: sticky;
+      top: 0;
+      width: 100%;
+      background: #323639;
+      color: #FFF;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      padding: 8px 16px;
+      box-sizing: border-box;
+      z-index: 100;
+    }
+    .pdf-toolbar button {
+      background: #1A7F79;
+      color: white;
+      border: none;
+      padding: 6px 14px;
+      border-radius: 4px;
+      font-weight: 500;
+      cursor: pointer;
+    }
+    @media print {
+      body { background: #FFF; }
+      .pdf-toolbar { display: none; }
+      #document-container { padding: 0; }
+      .pdf-page-canvas { box-shadow: none; margin: 0; page-break-after: always; }
+    }
+  </style>
+  <script src="../common/bridge-shim.js"></script>
+  <!-- 轻量离线 PDF.js 本地加载 -->
+  <script src="pdf.min.js"></script>
+  <script src="hatch_pdf_viewer.js?v=2"></script>
+</head>
+<body>
+  <div class="pdf-toolbar">
+    <span id="page-indicator">Loading PDF...</span>
+    <button onclick="window.printDocument()">Print Document / 打印</button>
+  </div>
+  <div id="document-container"></div>
+</body>
+</html>

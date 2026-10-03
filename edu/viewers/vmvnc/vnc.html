@@ -1,0 +1,678 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <!-- Never send a Referer (which would carry this page's URL) to any subresource. -->
+  <meta name="referrer" content="no-referrer">
+  <title>VM Browser</title>
+  <style>
+    html, body {
+      margin: 0;
+      padding: 0;
+      height: 100%;
+      /* Transparent so the app background shows through during connect (before noVNC paints its
+         own #screen background) instead of a white/black frame. */
+      background: transparent;
+      overflow: hidden;
+    }
+    /* Fill the WebView viewport via fixed insets. A `height: 100%` chain collapses to 0 height in
+       the Android WebView, which sizes the noVNC canvas to 0x0 and renders black. */
+    #screen {
+      position: fixed;
+      top: 0;
+      left: 0;
+      right: 0;
+      bottom: 0;
+      background: #1A202C;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      justify-content: center;
+      color: #E2E8F0;
+      font-family: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, monospace;
+    }
+    .vnc-placeholder {
+      background: #2D3748;
+      border: 1px solid #4A5568;
+      border-radius: 8px;
+      padding: 24px;
+      max-width: 90%;
+      width: 500px;
+      box-shadow: 0 10px 25px rgba(0,0,0,0.5);
+    }
+    .vnc-title {
+      font-size: 1.1rem;
+      font-weight: 600;
+      color: #38B2AC;
+      margin-bottom: 12px;
+      display: flex;
+      align-items: center;
+      gap: 8px;
+    }
+    .vnc-info {
+      font-size: 0.85rem;
+      line-height: 1.6;
+      color: #CBD5E0;
+    }
+    .vnc-tag {
+      display: inline-block;
+      background: #234E52;
+      color: #81E6D9;
+      padding: 2px 6px;
+      border-radius: 4px;
+      font-size: 0.75rem;
+      margin-top: 10px;
+    }
+  </style>
+  <script src="../common/bridge-shim.js"></script>
+</head>
+<body>
+  <div id="screen">
+    <div class="vnc-placeholder">
+      <div class="vnc-title">🖥️ Meta Muse 云端虚拟机 (VM Browser)</div>
+      <div class="vnc-info">
+        <div>• 协议引擎: noVNC (RFB 3.8 over WebSocket)</div>
+        <div>• 鉴权机制: Native Tigon 垫片 (注入 Bearer JWT)</div>
+        <div>• 传输通道: window.AndroidVncBridge ↔ Canvas</div>
+        <div>• 触控支持: 移动端视口动态裁剪与滚动重定向</div>
+        <div class="vnc-tag">STANDBY · 沙箱连接通道已就绪</div>
+      </div>
+    </div>
+  </div>
+  <script src="novnc-rfb.js"></script>
+  <script>
+    (function() {
+      // ---- Bridged WebSocket -------------------------------------------------------------------
+      // The websockify endpoint now requires `Authorization: Bearer <jwt>`, which a WebView
+      // WebSocket cannot set (no custom handshake headers in JS). So native code
+      // (BrowserSessionController) owns the real socket — opened over Tigon with the VM bearer —
+      // and this shim relays RFB frames over the AndroidVncBridge JS interface. noVNC is unaware:
+      // it constructs `new WebSocket(...)` (this class) and talks to it like a normal socket.
+      //
+      // noVNC's Websock.attach() requires the channel expose these as *own* properties:
+      // send, close, binaryType, onerror, onmessage, onopen, protocol, readyState — so everything
+      // below is assigned on the instance, not the prototype.
+      function bytesToBase64(bytes) {
+        var CHUNK = 0x8000;
+        var binary = '';
+        for (var i = 0; i < bytes.length; i += CHUNK) {
+          binary += String.fromCharCode.apply(null, bytes.subarray(i, i + CHUNK));
+        }
+        return btoa(binary);
+      }
+      function base64ToArrayBuffer(b64) {
+        var binary = atob(b64);
+        var len = binary.length;
+        var bytes = new Uint8Array(len);
+        for (var i = 0; i < len; i++) {
+          bytes[i] = binary.charCodeAt(i);
+        }
+        return bytes.buffer;
+      }
+      function base64ToUtf8(b64) {
+        var binary = atob(b64);
+        var len = binary.length;
+        var bytes = new Uint8Array(len);
+        for (var i = 0; i < len; i++) {
+          bytes[i] = binary.charCodeAt(i);
+        }
+        if (window.TextDecoder) {
+          return new TextDecoder('utf-8').decode(bytes);
+        }
+        var escaped = '';
+        for (var j = 0; j < bytes.length; j++) {
+          escaped += '%' + ('00' + bytes[j].toString(16)).slice(-2);
+        }
+        return decodeURIComponent(escaped);
+      }
+
+      function BridgedWebSocket(url, protocols) {
+        var self = this;
+        this.binaryType = 'arraybuffer';
+        this.protocol = (protocols && protocols.length) ? protocols[0] : '';
+        this.readyState = BridgedWebSocket.CONNECTING;
+        this.onopen = null;
+        this.onmessage = null;
+        this.onclose = null;
+        this.onerror = null;
+
+        this.send = function(data) {
+          var bytes;
+          if (data instanceof ArrayBuffer) {
+            bytes = new Uint8Array(data);
+          } else if (data && data.buffer) {
+            bytes = new Uint8Array(data.buffer, data.byteOffset, data.byteLength);
+          } else {
+            return;
+          }
+          try { window.AndroidVncBridge.socketSend(bytesToBase64(bytes)); } catch (e) {}
+        };
+        this.close = function() {
+          if (self.readyState === BridgedWebSocket.CLOSED) { return; }
+          self.readyState = BridgedWebSocket.CLOSING;
+          try { window.AndroidVncBridge.socketClose(); } catch (e) {}
+        };
+
+        // Internal transitions, driven by the native callbacks below.
+        this._opened = function(protocol) {
+          if (protocol) { self.protocol = protocol; }
+          self.readyState = BridgedWebSocket.OPEN;
+          if (self.onopen) { self.onopen({}); }
+        };
+        this._message = function(arrayBuffer) {
+          if (self.onmessage) { self.onmessage({ data: arrayBuffer }); }
+        };
+        this._closed = function(code, reason) {
+          if (self.readyState === BridgedWebSocket.CLOSED) { return; }
+          self.readyState = BridgedWebSocket.CLOSED;
+          if (self.onclose) { self.onclose({ code: code, reason: reason || '' }); }
+        };
+        this._failed = function() {
+          if (self.onerror) { self.onerror({}); }
+          self._closed(1006, '');
+        };
+
+        // noVNC opens exactly one socket; expose it for the native callbacks.
+        window.__vncSocket = this;
+        try {
+          window.AndroidVncBridge.socketOpen();
+        } catch (e) {
+          setTimeout(function() { self._failed(); }, 0);
+        }
+      }
+      BridgedWebSocket.CONNECTING = 0;
+      BridgedWebSocket.OPEN = 1;
+      BridgedWebSocket.CLOSING = 2;
+      BridgedWebSocket.CLOSED = 3;
+
+      // Native -> JS entry points (invoked via WebView.evaluateJavascript).
+      window.__vncBridge = {
+        onOpen: function(protocol) {
+          var s = window.__vncSocket; if (s) { s._opened(protocol); }
+        },
+        onMessage: function(b64) {
+          var s = window.__vncSocket; if (s) { s._message(base64ToArrayBuffer(b64)); }
+        },
+        onClose: function(code, reason) {
+          var s = window.__vncSocket; if (s) { s._closed(code, reason); }
+        },
+        onError: function() {
+          var s = window.__vncSocket; if (s) { s._failed(); }
+        }
+      };
+
+      window.WebSocket = BridgedWebSocket;
+
+      // ---- noVNC setup -------------------------------------------------------------------------
+      var RFB = window.__noVNC && window.__noVNC.default;
+      if (!RFB) {
+        document.body.innerText = 'noVNC bundle failed to load';
+        return;
+      }
+
+      // The URL is irrelevant — the bridged socket ignores it and native builds the real
+      // websockify URL. `binary` is the subprotocol the server requires (native re-sends it).
+      var rfb = new RFB(document.getElementById('screen'), 'wss://bridge.invalid/', {
+        wsProtocols: ['binary'],
+      });
+      var viewOnly = true;
+      try {
+        viewOnly = !!window.AndroidVncBridge.isViewOnly();
+      } catch (e) {}
+      rfb.viewOnly = viewOnly;
+      var coverViewportEnabled = viewOnly;
+      var panModeEnabled = viewOnly;
+      var zoomMultiplier = 1;
+      var maxViewportScale = 3;
+      var panModeDragActive = false;
+      var panModeDragLastX = 0;
+      var panModeDragLastY = 0;
+      var panModeRemoteScrollActive = false;
+      var panModeRemoteScrollMagnitudeX = 0;
+      var panModeRemoteScrollMagnitudeY = 0;
+      var panModePinchActive = false;
+      var panModePinchStartMagnitude = 0;
+      var panModePinchStartZoomMultiplier = 1;
+      try {
+        coverViewportEnabled = viewOnly || !!window.AndroidVncBridge.isCoverViewportEnabled();
+      } catch (e) {}
+      try {
+        panModeEnabled = viewOnly || !!window.AndroidVncBridge.isPanModeEnabled();
+      } catch (e) {}
+      try {
+        if (!viewOnly) {
+          zoomMultiplier = Math.max(1, Math.min(3, window.AndroidVncBridge.getZoomMultiplier()));
+        }
+      } catch (e) {}
+      rfb.scaleViewport = !usesViewportZoom();
+      rfb.clipViewport = usesViewportZoom();
+      rfb.dragViewport = usesViewportZoom() && panModeEnabled;
+      rfb.resizeSession = false;
+      // noVNC paints #screen rgb(40, 40, 40) by default, which shows as a grey slab wherever the
+      // fitted canvas does not reach. Let the app background show through instead.
+      rfb.background = 'transparent';
+
+      function usesViewportZoom() {
+        return coverViewportEnabled && (!viewOnly || zoomMultiplier > 1);
+      }
+
+      function redrawViewport() {
+        var display = rfb && rfb._display;
+        if (!display || !display._viewportLoc || !display._targetCtx || !display._backbuffer) {
+          return;
+        }
+        var viewport = display._viewportLoc;
+        var visibleWidth = Math.min(viewport.w, Math.max(0, display._fbWidth - viewport.x));
+        var visibleHeight = Math.min(viewport.h, Math.max(0, display._fbHeight - viewport.y));
+        display._targetCtx.clearRect(0, 0, display._target.width, display._target.height);
+        if (visibleWidth > 0 && visibleHeight > 0) {
+          display._targetCtx.drawImage(
+            display._backbuffer,
+            viewport.x,
+            viewport.y,
+            visibleWidth,
+            visibleHeight,
+            0,
+            0,
+            visibleWidth,
+            visibleHeight,
+          );
+        }
+      }
+
+      function panViewportBy(deltaX, deltaY) {
+        var display = rfb && rfb._display;
+        if (!display || !display._viewportLoc) {
+          return { x: 0, y: 0 };
+        }
+        var viewport = display._viewportLoc;
+        var maxX = Math.max(0, display._fbWidth - viewport.w);
+        var maxY = Math.max(0, display._fbHeight - viewport.h);
+        var requestedX = viewport.x + deltaX;
+        var requestedY = viewport.y + deltaY;
+        var overflowX = requestedX < 0 ? requestedX : Math.max(0, requestedX - maxX);
+        var overflowY = requestedY < 0 ? requestedY : Math.max(0, requestedY - maxY);
+        var nextX = Math.min(maxX, Math.max(0, Math.round(requestedX)));
+        var nextY = Math.min(maxY, Math.max(0, Math.round(requestedY)));
+        if (nextX === viewport.x && nextY === viewport.y) {
+          return { x: overflowX, y: overflowY };
+        }
+        viewport.x = nextX;
+        viewport.y = nextY;
+        redrawViewport();
+        return { x: overflowX, y: overflowY };
+      }
+
+      function dispatchRemoteScrollGesture(type, clientX, clientY) {
+        rfb._canvas.dispatchEvent(new CustomEvent(type, {
+          detail: {
+            type: 'twodrag',
+            clientX: clientX,
+            clientY: clientY,
+            magnitudeX: panModeRemoteScrollMagnitudeX,
+            magnitudeY: panModeRemoteScrollMagnitudeY,
+          },
+        }));
+      }
+
+      function scrollRemoteBy(clientX, clientY, deltaX, deltaY) {
+        if (viewOnly || (deltaX === 0 && deltaY === 0)) {
+          return;
+        }
+        if (!panModeRemoteScrollActive) {
+          panModeRemoteScrollActive = true;
+          panModeRemoteScrollMagnitudeX = 0;
+          panModeRemoteScrollMagnitudeY = 0;
+          dispatchRemoteScrollGesture('gesturestart', clientX, clientY);
+        }
+        panModeRemoteScrollMagnitudeX += deltaX;
+        panModeRemoteScrollMagnitudeY += deltaY;
+        dispatchRemoteScrollGesture('gesturemove', clientX, clientY);
+      }
+
+      function endRemoteScroll(clientX, clientY) {
+        if (!panModeRemoteScrollActive) {
+          return;
+        }
+        dispatchRemoteScrollGesture('gestureend', clientX, clientY);
+        panModeRemoteScrollActive = false;
+      }
+
+      function handlePanModeDrag(event) {
+        if (
+          (!panModeDragActive && (!coverViewportEnabled || !panModeEnabled)) ||
+          !event.detail ||
+          event.detail.type !== 'drag'
+        ) {
+          return;
+        }
+        event.stopImmediatePropagation();
+        event.preventDefault();
+        if (event.type === 'gesturestart') {
+          panModeDragActive = true;
+          panModeDragLastX = event.detail.clientX;
+          panModeDragLastY = event.detail.clientY;
+        } else if (event.type === 'gesturemove' && panModeDragActive) {
+          var display = rfb && rfb._display;
+          var scale = display && display.scale ? display.scale : 1;
+          var overflow = panViewportBy(
+            (panModeDragLastX - event.detail.clientX) / scale,
+            (panModeDragLastY - event.detail.clientY) / scale,
+          );
+          scrollRemoteBy(
+            event.detail.clientX,
+            event.detail.clientY,
+            -overflow.x * scale,
+            -overflow.y * scale,
+          );
+          panModeDragLastX = event.detail.clientX;
+          panModeDragLastY = event.detail.clientY;
+        } else if (event.type === 'gestureend') {
+          endRemoteScroll(event.detail.clientX, event.detail.clientY);
+          panModeDragActive = false;
+        }
+      }
+
+      rfb._canvas.addEventListener('gesturestart', handlePanModeDrag, true);
+      rfb._canvas.addEventListener('gesturemove', handlePanModeDrag, true);
+      rfb._canvas.addEventListener('gestureend', handlePanModeDrag, true);
+
+      function handlePanModePinch(event) {
+        if (
+          (!panModePinchActive && (!coverViewportEnabled || !panModeEnabled)) ||
+          !event.detail ||
+          event.detail.type !== 'pinch'
+        ) {
+          return;
+        }
+        event.stopImmediatePropagation();
+        event.preventDefault();
+        var magnitude = Math.hypot(event.detail.magnitudeX, event.detail.magnitudeY);
+        if (event.type === 'gesturestart') {
+          panModePinchActive = true;
+          panModePinchStartMagnitude = magnitude;
+          panModePinchStartZoomMultiplier = zoomMultiplier;
+        } else if (event.type === 'gesturemove' && panModePinchStartMagnitude > 0) {
+          setZoomMultiplier(
+            panModePinchStartZoomMultiplier * magnitude / panModePinchStartMagnitude,
+          );
+        } else if (event.type === 'gestureend') {
+          panModePinchActive = false;
+          panModePinchStartMagnitude = 0;
+        }
+      }
+
+      rfb._canvas.addEventListener('gesturestart', handlePanModePinch, true);
+      rfb._canvas.addEventListener('gesturemove', handlePanModePinch, true);
+      rfb._canvas.addEventListener('gestureend', handlePanModePinch, true);
+
+      function notify(event, detail) {
+        if (window.AndroidVncBridge && typeof window.AndroidVncBridge[event] === 'function') {
+          window.AndroidVncBridge[event](detail || '');
+        }
+      }
+
+      function setCanvasAlignment(scale, rect, display) {
+        try {
+          var canvas = document.querySelector('#screen canvas');
+          if (rfb && rfb._screen) {
+            rfb._screen.style.justifyContent = display.width * scale <= rect.width
+              ? 'center'
+              : 'flex-start';
+            rfb._screen.style.alignItems = display.height * scale <= rect.height
+              ? 'center'
+              : 'flex-start';
+            rfb._screen.style.overflow = 'hidden';
+          }
+          if (canvas) {
+            canvas.style.margin = '0';
+            canvas.style.display = 'block';
+          }
+        } catch (e) {}
+      }
+
+      function setCanvasFitCentered() {
+        try {
+          var canvas = document.querySelector('#screen canvas');
+          if (rfb && rfb._screen) {
+            rfb._screen.style.justifyContent = '';
+            rfb._screen.style.alignItems = '';
+            rfb._screen.style.overflow = 'auto';
+          }
+          if (canvas) {
+            canvas.style.margin = 'auto';
+            canvas.style.display = '';
+          }
+        } catch (e) {}
+      }
+
+      function viewportScaleBounds() {
+        var display = rfb && rfb._display;
+        if (!display || display.width <= 0 || display.height <= 0) {
+          return null;
+        }
+        var screen = document.getElementById('screen');
+        var rect = screen.getBoundingClientRect();
+        if (rect.width <= 0 || rect.height <= 0) {
+          return null;
+        }
+        var fitScale = Math.min(rect.width / display.width, rect.height / display.height, 1);
+        return {
+          display: display,
+          rect: rect,
+          fitScale: fitScale,
+          maxZoomMultiplier: Math.max(1, maxViewportScale / fitScale),
+        };
+      }
+
+      function applyViewportScale(resetToTopLeft) {
+        if (!usesViewportZoom()) {
+          return;
+        }
+        try {
+          var bounds = viewportScaleBounds();
+          if (!bounds) {
+            return;
+          }
+          var display = bounds.display;
+          var rect = bounds.rect;
+          zoomMultiplier = Math.max(1, Math.min(bounds.maxZoomMultiplier, zoomMultiplier));
+          var scale = bounds.fitScale * zoomMultiplier;
+          var viewportWidth = Math.ceil(rect.width / scale);
+          var viewportHeight = Math.ceil(rect.height / scale);
+          display.clipViewport = true;
+          display.viewportChangeSize(viewportWidth, viewportHeight);
+          if (resetToTopLeft && display._viewportLoc) {
+            display.viewportChangePos(-display._viewportLoc.x, -display._viewportLoc.y);
+          }
+          display.scale = scale;
+          setCanvasAlignment(scale, rect, display);
+        } catch (e) {}
+      }
+
+      function scheduleViewportScale(resetToTopLeft) {
+        if (!usesViewportZoom()) {
+          return;
+        }
+        window.requestAnimationFrame(function() {
+          applyViewportScale(resetToTopLeft);
+          setTimeout(function() { applyViewportScale(false); }, 0);
+        });
+      }
+
+      function applyFitScale() {
+        try {
+          rfb.scaleViewport = true;
+          rfb.clipViewport = false;
+          rfb.dragViewport = false;
+          setCanvasFitCentered();
+          if (rfb._display) {
+            rfb._display.clipViewport = false;
+          }
+          if (typeof rfb._updateClip === 'function') {
+            rfb._updateClip();
+          }
+          if (typeof rfb._updateScale === 'function') {
+            rfb._updateScale();
+          }
+        } catch (e) {}
+      }
+
+      function applyViewportMode() {
+        if (usesViewportZoom()) {
+          rfb.scaleViewport = false;
+          rfb.clipViewport = true;
+          rfb.dragViewport = panModeEnabled;
+          scheduleViewportScale(true);
+        } else {
+          applyFitScale();
+        }
+      }
+
+      function setCoverViewportEnabled(enabled) {
+        var nextEnabled = viewOnly || !!enabled;
+        if (viewOnly && coverViewportEnabled === nextEnabled) {
+          return;
+        }
+        coverViewportEnabled = nextEnabled;
+        applyViewportMode();
+      }
+
+      function setPanModeEnabled(enabled) {
+        panModeEnabled = viewOnly || !!enabled;
+        if (!panModeEnabled) {
+          endRemoteScroll(panModeDragLastX, panModeDragLastY);
+          panModeDragActive = false;
+        }
+        rfb.dragViewport = usesViewportZoom() && panModeEnabled;
+      }
+
+      function setZoomMultiplier(multiplier) {
+        var wasUsingViewportZoom = usesViewportZoom();
+        var bounds = viewportScaleBounds();
+        var maximum = bounds ? bounds.maxZoomMultiplier : 3;
+        zoomMultiplier = Math.max(1, Math.min(maximum, Number(multiplier) || 1));
+        if (wasUsingViewportZoom !== usesViewportZoom()) {
+          applyViewportMode();
+        } else if (usesViewportZoom()) {
+          scheduleViewportScale(false);
+        }
+      }
+
+      function sendKeysym(keysym) {
+        try {
+          rfb.focus();
+          rfb.sendKey(keysym);
+        } catch (e) {}
+      }
+
+      function typeText(text) {
+        for (var i = 0; i < text.length;) {
+          var codepoint = text.codePointAt(i);
+          i += codepoint > 0xffff ? 2 : 1;
+          if (codepoint === 10) {
+            sendKeysym(0xff0d);
+          } else if (codepoint === 9) {
+            sendKeysym(0xff09);
+          } else if (codepoint === 8) {
+            sendKeysym(0xff08);
+          } else {
+            sendKeysym(codepoint <= 0x7f ? codepoint : 0x01000000 + codepoint);
+          }
+        }
+      }
+
+      function typeBase64Text(b64) {
+        typeText(base64ToUtf8(b64));
+      }
+
+      function utf8ToBase64(text) {
+        return bytesToBase64(new TextEncoder().encode(text));
+      }
+
+      function pasteBase64Text(b64) {
+        try {
+          rfb.focus();
+          rfb.clipboardPasteFrom(base64ToUtf8(b64));
+        } catch (e) {}
+      }
+
+      var copyRequested = false;
+
+      function copySelection() {
+        copyRequested = true;
+        setTimeout(function() { copyRequested = false; }, 3000);
+        try {
+          rfb.focus();
+          rfb.sendKey(0xffe3, 'ControlLeft', true);
+          rfb.sendKey(0x0063, 'KeyC', true);
+          rfb.sendKey(0x0063, 'KeyC', false);
+          rfb.sendKey(0xffe3, 'ControlLeft', false);
+        } catch (e) {
+          copyRequested = false;
+        }
+      }
+
+      rfb.addEventListener('clipboard', function(e) {
+        try {
+          if (!copyRequested) { return; }
+          var text = e && e.detail && e.detail.text;
+          if (text) {
+            copyRequested = false;
+            notify('onClipboard', utf8ToBase64(text));
+          }
+        } catch (err) {}
+      });
+
+      window.__vncBridge.setCoverViewportEnabled = setCoverViewportEnabled;
+      window.__vncBridge.setPanModeEnabled = setPanModeEnabled;
+      window.__vncBridge.setZoomMultiplier = setZoomMultiplier;
+      window.__vncBridge.copySelection = copySelection;
+      window.__vncBridge.sendSpecialKey = sendKeysym;
+      window.__vncBridge.typeBase64Text = typeBase64Text;
+      window.__vncBridge.pasteBase64Text = pasteBase64Text;
+
+      var coverResizeObserver = null;
+      if (window.ResizeObserver) {
+        try {
+          coverResizeObserver = new ResizeObserver(function() { scheduleViewportScale(false); });
+          coverResizeObserver.observe(document.getElementById('screen'));
+        } catch (e) {}
+      }
+      window.addEventListener('resize', function() { scheduleViewportScale(false); });
+
+      // Report the live framebuffer's pixel size so native can size the browser frame to the remote
+      // display's aspect ratio. noVNC sizes the canvas element to the framebuffer on ServerInit
+      // (before 'connect'), so canvas.width/height are the fb pixels.
+      function reportFramebufferSize() {
+        try {
+          var canvas = document.querySelector('#screen canvas');
+          var display = rfb && rfb._display;
+          var width = display && display.width > 0 ? display.width : (canvas && canvas.width);
+          var height = display && display.height > 0 ? display.height : (canvas && canvas.height);
+          if (width > 0 && height > 0 &&
+              window.AndroidVncBridge &&
+              typeof window.AndroidVncBridge.onFramebufferSize === 'function') {
+            window.AndroidVncBridge.onFramebufferSize(width, height);
+          }
+        } catch (e) {}
+      }
+
+      // Recovery mirrors web: reconnect is event-driven on the RFB 'disconnect' (handled natively in
+      // BrowserSessionController, which reloads this page → fresh RFB → fresh native socket).
+      rfb.addEventListener('connect', function() {
+        reportFramebufferSize();
+        applyViewportMode();
+        notify('onConnected');
+      });
+      rfb.addEventListener('disconnect', function(e) {
+        notify('onDisconnected', (e && e.detail && e.detail.reason) || '');
+      });
+      rfb.addEventListener('securityfailure', function(e) {
+        notify('onSecurityFailure', (e && e.detail && e.detail.reason) || '');
+      });
+    })();
+  </script>
+</body>
+</html>

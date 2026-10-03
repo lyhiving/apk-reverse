@@ -34,11 +34,14 @@ tools/
 # sandbox installs made while testing `npx skills add .` against this repo
 .claude/
 .agents/
+.omc/
 *.log
 *.jsonl
 *.pcap
 *.png
 *.jpg
+!docs/reports/**
+!edu/**
 
 # python / editors
 __pycache__/
